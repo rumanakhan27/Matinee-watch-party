@@ -67,7 +67,7 @@ const STEPS = [
   },
 ];
 
-export default function Landing({ room }) {
+export default function Landing({ room, auth }) {
   const active = useActiveSection();
   const current = (id) => (active === id ? "true" : undefined);
 
@@ -106,7 +106,7 @@ export default function Landing({ room }) {
                 Create private rooms, invite your friends, and watch YouTube videos in perfect real-time
                 synchronization.
               </p>
-              <StartForm room={room} />
+              <StartForm room={room} auth={auth} />
             </div>
 
             <HeroDemo />

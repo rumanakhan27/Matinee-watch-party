@@ -2,8 +2,9 @@ import uuid
 
 
 class Participant:
-    def __init__(self, username, websocket, role="participant"):
-        self.user_id = str(uuid.uuid4())[:8]   # short random ID
+    def __init__(self, username, websocket, role="participant", account_id=None):
+        self.user_id = str(uuid.uuid4())[:8]   # short random ID (only for this room)
+        self.account_id = account_id           # the id in the users table
         self.username = username
         self.websocket = websocket
         self.role = role

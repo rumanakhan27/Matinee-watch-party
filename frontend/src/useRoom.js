@@ -17,7 +17,7 @@ const ACTION_TEXT = {
  * It opens the WebSocket, listens to every message from the server,
  * keeps the room's state, and gives the screens simple functions to call.
  */
-export function useRoom() {
+export function useRoom(token, onAuthError) {
   // Refs hold values that should NOT cause a re-draw when they change
   const wsRef = useRef(null);      // the WebSocket connection
   const myIdRef = useRef(null);    // my user id (known after joining)
@@ -153,6 +153,7 @@ export function useRoom() {
 
         case "error":
           notify(msg.message, "error");
+          if (msg.code === "auth" && onAuthError) onAuthError();   // login expired: back to the login form
           // An error before we are inside a room (for example "Room not found")
           if (!myIdRef.current) {
             closeSocket();
@@ -164,7 +165,7 @@ export function useRoom() {
           break;
       }
     },
-    [notify, closeSocket, resetRoom]
+    [notify, closeSocket, resetRoom, onAuthError]
   );
 
   // ---------- connecting ----------
@@ -217,8 +218,8 @@ export function useRoom() {
     [notify]
   );
 
-  const createRoom = useCallback((username) => connect({ type: "create_room", username }), [connect]);
-  const joinRoom = useCallback((code, username) => connect({ type: "join_room", roomId: code, username }), [connect]);
+  const createRoom = useCallback(() => connect({ type: "create_room", token }), [connect, token]);
+  const joinRoom = useCallback((code) => connect({ type: "join_room", roomId: code, token }), [connect, token]);
   const leaveRoom = useCallback(() => {
     const ws = wsRef.current;
     if (ws && ws.readyState === WebSocket.OPEN) {
