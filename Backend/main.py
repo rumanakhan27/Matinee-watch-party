@@ -1,6 +1,7 @@
 import os
 import time
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text as sql_text
@@ -21,6 +22,7 @@ from room_manager import RoomManager
 from youtube import extract_video_id
 
 
+# Runs init_db() when the server starts and closes DB connections when it stops
 @asynccontextmanager
 async def lifespan(app):
     await init_db()
@@ -31,18 +33,31 @@ async def lifespan(app):
 app = FastAPI(lifespan=lifespan)
 manager = RoomManager()
 
-origins = os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
+# Which frontend addresses may call this backend (set CORS_ORIGINS on Render)
+origins = [
+    o.strip().rstrip("/")
+    for o in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
+    if o.strip()
+]
+app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["*"], allow_headers=["*"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
+# /register and /login
 app.include_router(auth_router)
 
 
+# A friendly message for anyone who opens the backend's main address
+@app.get("/")
+async def root():
+    return {
+        "app": "Matinee: YouTube Watch Party API",
+        "status": "running",
+        "health_check": "/health",
+        "api_docs": "/docs",
+        "frontend": "https://matinee-watch-party.vercel.app",
+    }
+
+
+# A simple page to check that the server and database are alive
 @app.get("/health")
 async def health():
     async with engine.connect() as conn:
@@ -50,13 +65,8 @@ async def health():
     return {"status": "ok", "database": "connected"}
 
 
-ASSIGNABLE_ROLES = {"moderator", "participant", "viewer"}
-AUTO_ADVANCE_GUARD = 3
-
-
-def clean_username(value):
-    name = str(value or "").strip()[:30]
-    return name or "Guest"
+ASSIGNABLE_ROLES = {"moderator", "participant", "viewer"}   # "host" is only given by transfer
+AUTO_ADVANCE_GUARD = 3   # seconds. Ignore "video ended" reports right after a video started
 
 
 def joined_message(room, participant):
@@ -76,7 +86,7 @@ async def broadcast_queue(room, action, by, item):
     await room.broadcast({
         "type": "queue_updated",
         "queue": room.queue,
-        "action": action,
+        "action": action,      # added | removed | played | advanced
         "by": by,
         "item": item,
     })
@@ -87,6 +97,9 @@ async def broadcast_playback(room, action, by):
 
 
 async def queue_video(room, user_id, username, video_id):
+    """Adds a video to the queue, or starts it right away if nothing is loaded yet.
+    Only call this for allowed people: a host/moderator, or a request a host/moderator approved.
+    Returns False if the queue is full."""
     if room.video_id is None:
         room.apply_action("change_video", {"videoId": video_id})
         room.log(f"{username} {describe_action('change_video', {'videoId': video_id})}")
@@ -114,8 +127,9 @@ async def announce_cancelled(room, cancelled_requests):
 
 
 async def handle_leave(room, participant):
+    """Runs when someone disconnects. Also handles auto host handover."""
     if room.remove_participant(participant.user_id) is None:
-        return
+        return   # they were already removed (for example, kicked by the host)
 
     if room.is_empty():
         manager.delete_room(room.code)
@@ -153,8 +167,8 @@ async def handle_leave(room, participant):
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
-    participant = None
-    room = None
+    participant = None    # who this connection is
+    room = None           # which room they are in
 
     try:
         while True:
@@ -169,6 +183,7 @@ async def websocket_endpoint(ws: WebSocket):
 
             event = data.get("type")
 
+            # ---------- create / join (login token required) ----------
             if event == "create_room":
                 if participant is not None:
                     await ws.send_json({"type": "error", "message": "You are already in a room"})
@@ -210,13 +225,15 @@ async def websocket_endpoint(ws: WebSocket):
                     "participants": room.participant_list(),
                 })
 
+            # ---------- leaving ----------
             elif event == "leave_room":
                 if participant is None:
                     await ws.send_json({"type": "error", "message": "Join a room first"})
                     continue
-                await handle_leave(room, participant)
+                await handle_leave(room, participant)   # same cleanup as a dropped connection
                 break
 
+            # ---------- playback controls (host / moderator) ----------
             elif event in ("play", "pause", "seek", "change_video"):
                 if participant is None:
                     await ws.send_json({"type": "error", "message": "Join a room first"})
@@ -244,6 +261,7 @@ async def websocket_endpoint(ws: WebSocket):
                     "by": participant.username,
                 })
 
+            # ---------- chat and reactions (everyone) ----------
             elif event in ("chat", "react"):
                 if participant is None:
                     await ws.send_json({"type": "error", "message": "Join a room first"})
@@ -288,6 +306,7 @@ async def websocket_endpoint(ws: WebSocket):
                         "videoTime": room.get_state()["currentTime"],
                     })
 
+            # ---------- approval flow ----------
             elif event == "request_change":
                 if participant is None:
                     await ws.send_json({"type": "error", "message": "Join a room first"})
@@ -364,6 +383,7 @@ async def websocket_endpoint(ws: WebSocket):
                     "pendingRequests": room.request_list(),
                 })
 
+                # queue_add changes the queue, not the playback, so it sends no sync_state
                 if status == "approved" and request["action"] != "queue_add":
                     await room.broadcast({
                         "type": "sync_state",
@@ -372,6 +392,7 @@ async def websocket_endpoint(ws: WebSocket):
                         "by": f"{request['username']} (approved by {participant.username})",
                     })
 
+            # ---------- video queue ----------
             elif event in ("queue_add", "queue_remove", "queue_play", "video_ended"):
                 if participant is None:
                     await ws.send_json({"type": "error", "message": "Join a room first"})
@@ -418,6 +439,8 @@ async def websocket_endpoint(ws: WebSocket):
                     await broadcast_playback(room, "change_video", participant.username)
 
                 elif event == "video_ended":
+                    # Every host/moderator browser reports this, but only the first report counts:
+                    # after it, room.video_id and updated_at have changed, so the others are ignored.
                     if data.get("videoId") != room.video_id:
                         continue
                     if time.time() - room.updated_at < AUTO_ADVANCE_GUARD:
@@ -430,6 +453,7 @@ async def websocket_endpoint(ws: WebSocket):
                     await broadcast_queue(room, "advanced", None, item)
                     await broadcast_playback(room, "next_video", "The queue")
 
+            # ---------- host powers ----------
             elif event in ("assign_role", "remove_participant", "transfer_host"):
                 if participant is None:
                     await ws.send_json({"type": "error", "message": "Join a room first"})
@@ -475,8 +499,8 @@ async def websocket_endpoint(ws: WebSocket):
                         "username": target.username,
                         "participants": room.participant_list(),
                     }
-                    await target.send(payload)
-                    await room.broadcast(payload)
+                    await target.send(payload)       # tell the removed person
+                    await room.broadcast(payload)    # tell everyone who is left
                     await announce_cancelled(room, cancelled)
                     try:
                         await target.websocket.close()
@@ -484,7 +508,7 @@ async def websocket_endpoint(ws: WebSocket):
                         pass
 
                 elif event == "transfer_host":
-                    participant.role = "moderator"
+                    participant.role = "moderator"   # the old host becomes a moderator
                     target.role = "host"
                     room.log(f"{participant.username} made {target.username} the host")
                     await room.broadcast({
@@ -495,7 +519,7 @@ async def websocket_endpoint(ws: WebSocket):
                         "participants": room.participant_list(),
                     })
 
-        await ws.close()
+        await ws.close()   # we only get here after leave_room
 
     except WebSocketDisconnect:
         if room and participant:
